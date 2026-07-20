@@ -237,7 +237,7 @@ herdr pane release-agent <pane_id> \
 
 当官方集成上报了原生会话引用时,`pane get`、`pane list`、`agent get` 和 `agent list` 会包含一个只读的 `agent_session` 对象。没有存储原生会话引用时,该字段被省略。
 
-当 Herdr 能解析控制窗格的前台进程的 cwd 时,这些命令会包含 `foreground_cwd`。已有的 `cwd` 字段仍然是用于标签和 follow-cwd 行为的窗格/工作区 cwd。
+当 Herdr 能解析控制窗格的前台进程的 cwd 时,这些命令会包含 `foreground_cwd`。该值由周期性探测采样,可能短暂滞后于实际进程。自定义工作区标签始终优先。未设置自定义标签时,标签依次取活动标签页中聚焦窗格的 `foreground_cwd`、该窗格 shell cwd,最后回退到工作区身份 cwd。已有的 `cwd` 字段仍然是用于 follow-cwd 行为的窗格/工作区 cwd。
 
 上报仅用于展示的窗格元数据,而不接管语义状态:
 
