@@ -73,12 +73,8 @@ impl App {
             }
             return self.find_parent_workspace_by_key(&api.repo_key);
         }
-        let git_space = workspace.git_space().cloned().or_else(|| {
-            workspace
-                .resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                .as_deref()
-                .and_then(crate::workspace::git_space_metadata)
-        });
+        let git_space =
+            workspace.git_space_for_identity(&self.state.terminals, &self.terminal_runtimes);
         if git_space.is_some_and(|space| {
             !space.is_linked_worktree
                 && space.key == api.repo_key

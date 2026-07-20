@@ -1019,11 +1019,8 @@ impl AppState {
                         .get(idx)
                         .and_then(|ws| {
                             let group_state = crate::ui::workspace_parent_group_state(self, idx);
-                            let git_space = ws.git_space().cloned().or_else(|| {
-                                ws.resolved_identity_cwd_from(&self.terminals, terminal_runtimes)
-                                    .as_deref()
-                                    .and_then(crate::workspace::git_space_metadata)
-                            });
+                            let git_space =
+                                ws.git_space_for_identity(&self.terminals, terminal_runtimes);
                             let is_linked_worktree = ws.worktree_space().map_or_else(
                                 || {
                                     git_space

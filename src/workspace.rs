@@ -141,6 +141,31 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
     }
 }
 
+/// Derived Git repo metadata paired with the resolved identity cwd that
+/// produced it.
+///
+/// The resolved identity follows pane focus immediately. The cache only
+/// refreshes on the periodic git status cycle. `git_space_for_identity`
+/// trusts the cache only when `source_cwd` matches the current resolved
+/// identity cwd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitSpaceCache {
+    pub(crate) source_cwd: PathBuf,
+    pub(crate) space: Option<GitSpaceMetadata>,
+}
+
+impl GitSpaceCache {
+    /// Resolve git-space metadata for `source_cwd` and record the pairing.
+    /// Constructing the pair from one cwd is the cache-trust invariant:
+    /// consumers may trust `space` only while their cwd matches `source_cwd`.
+    pub(crate) fn resolve(source_cwd: PathBuf) -> Self {
+        Self {
+            space: git_space_metadata(&source_cwd),
+            source_cwd,
+        }
+    }
+}
+
 /// A named workspace containing tabs.
 pub struct Workspace {
     /// Stable public workspace identity, independent of display order.
@@ -153,8 +178,9 @@ pub struct Workspace {
     pub(crate) cached_git_branch: Option<String>,
     /// Cached ahead/behind counts for the workspace repo's current branch upstream.
     pub(crate) cached_git_ahead_behind: Option<(usize, usize)>,
-    /// Cached derived Git repo metadata for worktree actions and status display.
-    pub(crate) cached_git_space: Option<GitSpaceMetadata>,
+    /// Cached derived Git repo metadata for worktree actions, keyed by the
+    /// resolved identity cwd that produced it.
+    pub(crate) cached_git_space: Option<GitSpaceCache>,
     /// Explicit Herdr-managed worktree grouping provenance.
     pub worktree_space: Option<WorktreeSpaceMembership>,
     pub(crate) metadata_tokens: crate::metadata_tokens::MetadataTokens,
@@ -216,7 +242,7 @@ impl Workspace {
             identity_cwd: identity_cwd.clone(),
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
-            cached_git_space: git_space_metadata(&identity_cwd),
+            cached_git_space: Some(GitSpaceCache::resolve(identity_cwd.clone())),
             worktree_space: None,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
@@ -1045,9 +1071,8 @@ impl Workspace {
         terminals: &HashMap<TerminalId, TerminalState>,
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> Option<PathBuf> {
-        self.tabs
-            .first()
-            .and_then(|tab| tab.cwd_for_pane(tab.root_pane, terminals, terminal_runtimes))
+        self.active_tab()
+            .and_then(|tab| tab.cwd_for_pane(tab.layout.focused(), terminals, terminal_runtimes))
             .or_else(|| Some(self.identity_cwd.clone()))
     }
 
@@ -1071,16 +1096,10 @@ impl Workspace {
         }
 
         // The label uses the focused pane's foreground process cwd, then
-        // that pane's shell cwd, then the workspace identity cwd. The
-        // foreground cwd is transient and the label is display-only. The
-        // resolved identity for persistence and git status stays on the
-        // first tab's root pane.
+        // the workspace resolved identity cwd. The foreground cwd is
+        // transient and the label is display-only.
         self.active_tab()
-            .and_then(|tab| {
-                let pane = tab.layout.focused();
-                tab.foreground_cwd_for_pane(pane, terminal_runtimes)
-                    .or_else(|| tab.cwd_for_pane(pane, terminals, terminal_runtimes))
-            })
+            .and_then(|tab| tab.foreground_cwd_for_pane(tab.layout.focused(), terminal_runtimes))
             .or_else(|| self.resolved_identity_cwd_from(terminals, terminal_runtimes))
             .map(|cwd| derive_label_from_cwd(&cwd))
             .unwrap_or_else(|| "workspace".into())
@@ -1094,8 +1113,28 @@ impl Workspace {
         self.cached_git_ahead_behind
     }
 
-    pub fn git_space(&self) -> Option<&GitSpaceMetadata> {
-        self.cached_git_space.as_ref()
+    /// Git space metadata for the workspace's current resolved identity.
+    ///
+    /// This returns the cached metadata when the cache came from the
+    /// current resolved identity cwd and holds metadata. In every other
+    /// case it re-resolves from disk. A focus switch to a pane in another
+    /// repo must not act through a stale cache during the refresh window.
+    /// A cached `None` is not trusted: a repo created after the last
+    /// refresh must be visible immediately.
+    pub fn git_space_for_identity(
+        &self,
+        terminals: &HashMap<TerminalId, TerminalState>,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+    ) -> Option<GitSpaceMetadata> {
+        let cwd = self.resolved_identity_cwd_from(terminals, terminal_runtimes);
+        if let Some(cache) = &self.cached_git_space {
+            if Some(&cache.source_cwd) == cwd.as_ref() {
+                if let Some(space) = &cache.space {
+                    return Some(space.clone());
+                }
+            }
+        }
+        cwd.as_deref().and_then(git_space_metadata)
     }
 
     pub fn worktree_space(&self) -> Option<&WorktreeSpaceMembership> {
@@ -1107,7 +1146,7 @@ impl Workspace {
         let cwd = self.resolved_identity_cwd();
         self.cached_git_branch = cwd.as_deref().and_then(git_branch);
         self.cached_git_ahead_behind = cwd.as_deref().and_then(git_ahead_behind);
-        self.cached_git_space = cwd.as_deref().and_then(git_space_metadata);
+        self.cached_git_space = cwd.map(GitSpaceCache::resolve);
     }
 
     pub fn git_status_snapshot_for_cwd_with_cache(
@@ -1583,45 +1622,160 @@ mod tests {
     }
 
     #[test]
-    fn workspace_identity_follows_first_tab_root_pane_cwd() {
+    fn workspace_identity_follows_focused_pane_cwd() {
         let mut ws = Workspace::test_new("ignored");
         ws.custom_name = None;
         let root_pane = ws.tabs[0].root_pane;
         let split_pane = ws.test_split(Direction::Horizontal);
-        let second_tab = ws.test_add_tab(None);
-        let terminal_id = ws.tabs[0].terminal_id(root_pane).unwrap().clone();
+        let root_terminal = ws.tabs[0].terminal_id(root_pane).unwrap().clone();
         let split_terminal = ws.tabs[0].terminal_id(split_pane).unwrap().clone();
         let mut terminals = HashMap::new();
         terminals.insert(
-            terminal_id.clone(),
-            TerminalState::new(terminal_id, PathBuf::from("/herdr-test/pion")),
+            root_terminal.clone(),
+            TerminalState::new(root_terminal.clone(), PathBuf::from("/herdr-test/pion")),
         );
         terminals.insert(
             split_terminal.clone(),
             TerminalState::new(split_terminal, PathBuf::from("/herdr-test/muon")),
         );
-        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let mut terminal_runtimes = TerminalRuntimeRegistry::new();
+        // A foreground cwd exists, but the identity must keep following the
+        // pane shell cwd. The foreground cwd is transient and only feeds the
+        // display label.
+        terminal_runtimes
+            .set_test_foreground_cwd(root_terminal, PathBuf::from("/herdr-test/nested"));
 
-        ws.switch_tab(0);
         ws.tabs[0].layout.focus_pane(root_pane);
-        assert_eq!(ws.display_name_from(&terminals, &terminal_runtimes), "pion");
         assert_eq!(
             ws.resolved_identity_cwd_from(&terminals, &terminal_runtimes),
             Some(PathBuf::from("/herdr-test/pion"))
         );
 
-        // The identity stays on the first tab's root pane when focus moves
-        // to another pane or another tab.
         ws.tabs[0].layout.focus_pane(split_pane);
         assert_eq!(
             ws.resolved_identity_cwd_from(&terminals, &terminal_runtimes),
-            Some(PathBuf::from("/herdr-test/pion"))
+            Some(PathBuf::from("/herdr-test/muon"))
         );
+    }
+
+    #[test]
+    fn workspace_identity_follows_active_tab_focused_pane() {
+        let mut ws = Workspace::test_new("ignored");
+        ws.custom_name = None;
+        let second_tab = ws.test_add_tab(None);
+        let second_root = ws.tabs[second_tab].root_pane;
+        let second_terminal = ws.tabs[second_tab]
+            .terminal_id(second_root)
+            .unwrap()
+            .clone();
+        let mut terminals = HashMap::new();
+        terminals.insert(
+            second_terminal.clone(),
+            TerminalState::new(second_terminal, PathBuf::from("/herdr-test/muon")),
+        );
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+
+        // The first tab's pane has no terminal state. While that tab is
+        // active, the identity falls back to the stored identity cwd.
+        assert_eq!(
+            ws.resolved_identity_cwd_from(&terminals, &terminal_runtimes),
+            ws.resolved_identity_cwd()
+        );
+
         ws.switch_tab(second_tab);
         assert_eq!(
             ws.resolved_identity_cwd_from(&terminals, &terminal_runtimes),
-            Some(PathBuf::from("/herdr-test/pion"))
+            Some(PathBuf::from("/herdr-test/muon"))
         );
+    }
+
+    #[test]
+    fn git_space_for_identity_ignores_cache_from_other_cwd() {
+        let mut ws = Workspace::test_new("ignored");
+        ws.custom_name = None;
+        let root_pane = ws.tabs[0].root_pane;
+        let terminal_id = ws.tabs[0].terminal_id(root_pane).unwrap().clone();
+        let mut terminals = HashMap::new();
+        terminals.insert(
+            terminal_id.clone(),
+            TerminalState::new(terminal_id, PathBuf::from("/herdr-test/other-repo")),
+        );
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let cached_space = GitSpaceMetadata {
+            key: "cached-repo".into(),
+            checkout_key: "/herdr-test/cached-repo".into(),
+            label: "cached-repo".into(),
+            repo_root: PathBuf::from("/herdr-test/cached-repo"),
+            is_linked_worktree: false,
+        };
+        ws.cached_git_space = Some(GitSpaceCache {
+            source_cwd: PathBuf::from("/herdr-test/cached-repo"),
+            space: Some(cached_space.clone()),
+        });
+
+        // The focused pane resolves to a different cwd than the cache
+        // source, so `git_space_for_identity` must not return the stale
+        // cache. /herdr-test/other-repo is not a real repo, so re-resolution
+        // yields None.
+        assert_eq!(
+            ws.git_space_for_identity(&terminals, &terminal_runtimes),
+            None
+        );
+
+        // The cache source matches the resolved identity cwd again, so
+        // `git_space_for_identity` trusts the cache.
+        ws.cached_git_space = Some(GitSpaceCache {
+            source_cwd: PathBuf::from("/herdr-test/other-repo"),
+            space: Some(cached_space.clone()),
+        });
+        assert_eq!(
+            ws.git_space_for_identity(&terminals, &terminal_runtimes),
+            Some(cached_space)
+        );
+    }
+
+    #[test]
+    fn git_space_for_identity_reresolves_matched_cache_without_space() {
+        let repo = std::env::temp_dir().join(format!(
+            "herdr-gitspace-none-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let mut ws = Workspace::test_new("ignored");
+        ws.custom_name = None;
+        let root_pane = ws.tabs[0].root_pane;
+        let terminal_id = ws.tabs[0].terminal_id(root_pane).unwrap().clone();
+        let mut terminals = HashMap::new();
+        terminals.insert(
+            terminal_id.clone(),
+            TerminalState::new(terminal_id, repo.clone()),
+        );
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        // The cache matches the resolved identity cwd but recorded no git
+        // space, as if it was refreshed before this repo was initialized.
+        ws.cached_git_space = Some(GitSpaceCache {
+            source_cwd: repo.clone(),
+            space: None,
+        });
+
+        let space = ws
+            .git_space_for_identity(&terminals, &terminal_runtimes)
+            .expect("a cached None must re-resolve from disk");
+        assert!(!space.is_linked_worktree);
+
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use super::responses::{encode_error, encode_success};
 
 mod deferred;
 
-struct ApiFailure {
+pub(crate) struct ApiFailure {
     code: &'static str,
     message: String,
 }
@@ -21,6 +21,10 @@ impl ApiFailure {
             code,
             message: message.into(),
         }
+    }
+
+    pub(crate) fn into_message(self) -> String {
+        self.message
     }
 }
 
@@ -36,12 +40,12 @@ fn absolute_user_path(path: &str) -> Result<PathBuf, ApiFailure> {
     }
 }
 
-struct WorktreeSource {
-    workspace_idx: Option<usize>,
-    source_checkout_path: PathBuf,
-    source_repo_root: PathBuf,
-    repo_key: String,
-    repo_name: String,
+pub(crate) struct WorktreeSource {
+    pub(crate) workspace_idx: Option<usize>,
+    pub(crate) source_checkout_path: PathBuf,
+    pub(crate) source_repo_root: PathBuf,
+    pub(crate) repo_key: String,
+    pub(crate) repo_name: String,
 }
 
 impl App {
@@ -279,7 +283,10 @@ impl App {
         self.worktree_list_source_from_workspace(ws_idx)
     }
 
-    fn worktree_source_from_workspace(&self, ws_idx: usize) -> Result<WorktreeSource, ApiFailure> {
+    pub(crate) fn worktree_source_from_workspace(
+        &self,
+        ws_idx: usize,
+    ) -> Result<WorktreeSource, ApiFailure> {
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
             return Err(ApiFailure::new(
                 "workspace_not_found",
@@ -302,11 +309,7 @@ impl App {
             });
         }
 
-        let git_space = ws.git_space().cloned().or_else(|| {
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                .as_deref()
-                .and_then(crate::workspace::git_space_metadata)
-        });
+        let git_space = ws.git_space_for_identity(&self.state.terminals, &self.terminal_runtimes);
         let Some(space) = git_space else {
             return Err(ApiFailure::new(
                 "not_git_worktree",
@@ -358,11 +361,7 @@ impl App {
             });
         }
 
-        let git_space = ws.git_space().cloned().or_else(|| {
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                .as_deref()
-                .and_then(crate::workspace::git_space_metadata)
-        });
+        let git_space = ws.git_space_for_identity(&self.state.terminals, &self.terminal_runtimes);
         let Some(space) = git_space else {
             return Err(ApiFailure::new(
                 "not_git_worktree",
@@ -425,13 +424,28 @@ impl App {
     }
 
     fn find_parent_workspace_by_key(&self, repo_key: &str) -> Option<usize> {
-        self.state.workspaces.iter().position(|ws| {
-            ws.worktree_space()
-                .is_some_and(|space| space.key == repo_key && !space.is_linked_worktree)
-                || ws
-                    .git_space()
+        // Membership-first across all workspaces: a durable parent
+        // membership anywhere in the list wins before any live-identity
+        // match is considered, so iteration order cannot let a pane that
+        // happens to sit in the parent repo claim parenthood ahead of the
+        // managed parent workspace (a parent match here gets its membership
+        // rewritten to parent). Workspaces with any durable membership are
+        // excluded from the live-identity pass.
+        self.state
+            .workspaces
+            .iter()
+            .position(|ws| {
+                ws.worktree_space()
                     .is_some_and(|space| space.key == repo_key && !space.is_linked_worktree)
-        })
+            })
+            .or_else(|| {
+                self.state.workspaces.iter().position(|ws| {
+                    ws.worktree_space().is_none()
+                        && ws
+                            .git_space_for_identity(&self.state.terminals, &self.terminal_runtimes)
+                            .is_some_and(|space| space.key == repo_key && !space.is_linked_worktree)
+                })
+            })
     }
 
     fn mark_worktree_membership(
@@ -569,31 +583,45 @@ impl App {
     pub(crate) fn open_workspace_idx_for_checkout(&self, checkout_path: &Path) -> Option<usize> {
         let canonical_checkout = crate::worktree::canonical_or_original(checkout_path);
         let checkout_key = canonical_checkout.display().to_string();
-        self.state.workspaces.iter().position(|ws| {
-            if ws.worktree_space().is_some_and(|space| {
-                crate::worktree::canonical_or_original(&space.checkout_path) == canonical_checkout
-            }) {
-                return true;
-            }
-
-            let git_space = ws.git_space().cloned().or_else(|| {
-                ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                    .as_deref()
-                    .and_then(crate::workspace::git_space_metadata)
-            });
-            if git_space
-                .as_ref()
-                .is_some_and(|metadata| metadata.checkout_key == checkout_key)
-            {
-                return true;
-            }
-
-            ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
-                .as_deref()
-                .is_some_and(|cwd| {
-                    crate::worktree::canonical_or_original(cwd) == canonical_checkout
+        // Membership-first across all workspaces: a durable membership
+        // anywhere in the list decides which workspace has the checkout
+        // open before any live-identity match is considered, so iteration
+        // order cannot let a pane visiting the checkout claim it ahead of
+        // the workspace that durably owns it (the open flow writes
+        // membership to the returned workspace unconditionally). Workspaces
+        // with any durable membership are excluded from the live-identity
+        // pass.
+        self.state
+            .workspaces
+            .iter()
+            .position(|ws| {
+                ws.worktree_space().is_some_and(|space| {
+                    crate::worktree::canonical_or_original(&space.checkout_path)
+                        == canonical_checkout
                 })
-        })
+            })
+            .or_else(|| {
+                self.state.workspaces.iter().position(|ws| {
+                    if ws.worktree_space().is_some() {
+                        return false;
+                    }
+
+                    let git_space =
+                        ws.git_space_for_identity(&self.state.terminals, &self.terminal_runtimes);
+                    if git_space
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.checkout_key == checkout_key)
+                    {
+                        return true;
+                    }
+
+                    ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)
+                        .as_deref()
+                        .is_some_and(|cwd| {
+                            crate::worktree::canonical_or_original(cwd) == canonical_checkout
+                        })
+                })
+            })
     }
 
     pub(crate) fn worktree_info_for_workspace(&self, ws_idx: usize) -> Option<WorktreeInfo> {
@@ -1443,6 +1471,198 @@ mod tests {
         let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false);
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn api_worktree_open_from_managed_parent_with_linked_identity_creates_workspace() {
+        let repo = create_committed_repo("api-worktree-open-managed-parent-repo");
+        let checkout = unique_temp_path("api-worktree-open-managed-parent-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "worktree/api-open-managed",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let canonical_repo = crate::worktree::canonical_or_original(&repo);
+        let canonical_checkout = crate::worktree::canonical_or_original(&checkout);
+
+        let mut app = test_app();
+        app.state.default_shell = test_shell().into();
+        let mut parent = Workspace::test_new("main");
+        // The parent's focused pane sits inside the linked checkout being
+        // opened: the resolved identity cwd is the checkout, and the cache
+        // pairs that cwd with the linked metadata it resolves to.
+        parent.identity_cwd = checkout.clone();
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: canonical_repo.display().to_string(),
+            label: "repo".into(),
+            repo_root: repo.clone(),
+            checkout_path: repo.clone(),
+            is_linked_worktree: false,
+        });
+        app.state.workspaces = vec![parent];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let resolved = app.state.workspaces[0]
+            .resolved_identity_cwd_from(&app.state.terminals, &app.terminal_runtimes)
+            .unwrap();
+        assert_eq!(resolved, checkout);
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceCache {
+            source_cwd: resolved,
+            space: Some(crate::workspace::GitSpaceMetadata {
+                key: canonical_repo.display().to_string(),
+                checkout_key: canonical_checkout.display().to_string(),
+                label: "repo".into(),
+                repo_root: repo.clone(),
+                is_linked_worktree: true,
+            }),
+        });
+        let workspace_id = app.state.workspaces[0].id.clone();
+
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: crate::api::schema::Method::WorktreeOpen(WorktreeOpenParams {
+                workspace_id: Some(workspace_id),
+                branch: Some("worktree/api-open-managed".into()),
+                focus: true,
+                ..WorktreeOpenParams::default()
+            }),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::WorktreeOpened { already_open, .. } = success.result else {
+            panic!("expected worktree_opened response");
+        };
+        // The parent workspace must not be treated as already having the
+        // linked checkout open, and its durable parent membership must
+        // survive the open.
+        assert!(!already_open);
+        assert_eq!(app.state.workspaces.len(), 2);
+        let parent_membership = app.state.workspaces[0].worktree_space().unwrap();
+        assert!(!parent_membership.is_linked_worktree);
+        assert_eq!(parent_membership.checkout_path, repo);
+        assert!(
+            app.state.workspaces[1]
+                .worktree_space()
+                .unwrap()
+                .is_linked_worktree
+        );
+
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn find_parent_workspace_skips_linked_membership_with_parent_identity() {
+        let mut app = test_app();
+        let mut linked = Workspace::test_new("linked");
+        // The linked workspace's focused pane is cd'ed to the parent repo
+        // root: its live identity claims parent metadata rooted at that cwd.
+        linked.identity_cwd = "/repo/herdr".into();
+        linked.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-issue".into(),
+            is_linked_worktree: true,
+        });
+        let parent = Workspace::test_new("parent");
+        app.state.workspaces = vec![linked, parent];
+        app.state.ensure_test_terminals();
+        let resolved = app.state.workspaces[0]
+            .resolved_identity_cwd_from(&app.state.terminals, &app.terminal_runtimes)
+            .unwrap();
+        assert_eq!(resolved, std::path::PathBuf::from("/repo/herdr"));
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceCache {
+            source_cwd: resolved,
+            space: Some(crate::workspace::GitSpaceMetadata {
+                key: "repo-key".into(),
+                checkout_key: "/repo/herdr".into(),
+                label: "herdr".into(),
+                repo_root: "/repo/herdr".into(),
+                is_linked_worktree: false,
+            }),
+        });
+        app.state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+
+        assert_eq!(app.find_parent_workspace_by_key("repo-key"), Some(1));
+    }
+
+    #[test]
+    fn open_workspace_idx_for_checkout_prefers_later_durable_membership_over_live_match() {
+        let mut app = test_app();
+        // The visitor workspace has no membership; its focused pane is
+        // cd'ed into the checkout, so it live-matches by resolved cwd.
+        let mut visitor = Workspace::test_new("visitor");
+        visitor.identity_cwd = "/repo/herdr-issue".into();
+        // The managed workspace durably owns the checkout but is ordered
+        // after the visitor.
+        let mut managed = Workspace::test_new("managed");
+        managed.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-issue".into(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces = vec![visitor, managed];
+        app.state.ensure_test_terminals();
+
+        assert_eq!(
+            app.open_workspace_idx_for_checkout(Path::new("/repo/herdr-issue")),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn find_parent_workspace_prefers_later_durable_membership_over_live_match() {
+        let mut app = test_app();
+        // The visitor workspace has no membership; its focused pane is
+        // cd'ed to the parent repo root, so its live identity claims
+        // parent metadata rooted at that cwd.
+        let mut visitor = Workspace::test_new("visitor");
+        visitor.identity_cwd = "/repo/herdr".into();
+        // The managed parent is ordered after the visitor.
+        let mut parent = Workspace::test_new("parent");
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+        app.state.workspaces = vec![visitor, parent];
+        app.state.ensure_test_terminals();
+        let resolved = app.state.workspaces[0]
+            .resolved_identity_cwd_from(&app.state.terminals, &app.terminal_runtimes)
+            .unwrap();
+        assert_eq!(resolved, std::path::PathBuf::from("/repo/herdr"));
+        app.state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceCache {
+            source_cwd: resolved,
+            space: Some(crate::workspace::GitSpaceMetadata {
+                key: "repo-key".into(),
+                checkout_key: "/repo/herdr".into(),
+                label: "herdr".into(),
+                repo_root: "/repo/herdr".into(),
+                is_linked_worktree: false,
+            }),
+        });
+
+        assert_eq!(app.find_parent_workspace_by_key("repo-key"), Some(1));
     }
 
     #[test]

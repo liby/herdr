@@ -2608,10 +2608,18 @@ impl AppState {
                 ws.cached_git_ahead_behind = result.ahead_behind;
                 changed = true;
             }
-            if ws.cached_git_space != result.space {
-                ws.cached_git_space = result.space;
+            if ws
+                .cached_git_space
+                .as_ref()
+                .and_then(|cache| cache.space.as_ref())
+                != result.space.as_ref()
+            {
                 changed = true;
             }
+            ws.cached_git_space = Some(crate::workspace::GitSpaceCache {
+                source_cwd: result.resolved_identity_cwd,
+                space: result.space,
+            });
         }
         changed
     }
@@ -3950,6 +3958,42 @@ mod tests {
         assert!(changed);
         assert_eq!(state.workspaces[0].branch(), None);
         assert_eq!(state.workspaces[0].git_ahead_behind(), None);
+    }
+
+    #[test]
+    fn apply_workspace_git_statuses_records_git_space_source_cwd() {
+        let mut state = app_with_workspaces(&["one"]);
+        let workspace_id = state.workspaces[0].id.clone();
+        let cwd = state.workspaces[0].resolved_identity_cwd().unwrap();
+        let space = crate::workspace::GitSpaceMetadata {
+            key: "repo-key".into(),
+            checkout_key: "/repo/checkout".into(),
+            label: "repo".into(),
+            repo_root: std::path::PathBuf::from("/repo/checkout"),
+            is_linked_worktree: false,
+        };
+
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        state.apply_workspace_git_statuses(
+            &terminal_runtimes,
+            vec![WorkspaceGitStatus {
+                workspace_id,
+                resolved_identity_cwd: cwd.clone(),
+                branch: None,
+                ahead_behind: None,
+                space: Some(space.clone()),
+            }],
+        );
+
+        // `git_space_for_identity` trusts the cache only when the recorded
+        // source cwd matches the result's resolved identity cwd.
+        assert_eq!(
+            state.workspaces[0].cached_git_space,
+            Some(crate::workspace::GitSpaceCache {
+                source_cwd: cwd,
+                space: Some(space),
+            })
+        );
     }
 
     #[test]

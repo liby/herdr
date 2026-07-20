@@ -2282,12 +2282,15 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
 
     fn workspace_with_git_space(name: &str, key: &str) -> crate::workspace::Workspace {
         let mut ws = crate::workspace::Workspace::test_new(name);
-        ws.cached_git_space = Some(crate::workspace::GitSpaceMetadata {
-            key: key.into(),
-            checkout_key: format!("/repo/{name}"),
-            label: "herdr".into(),
-            repo_root: std::path::PathBuf::from(format!("/repo/{name}")),
-            is_linked_worktree: false,
+        ws.cached_git_space = Some(crate::workspace::GitSpaceCache {
+            source_cwd: std::path::PathBuf::from(format!("/repo/{name}")),
+            space: Some(crate::workspace::GitSpaceMetadata {
+                key: key.into(),
+                checkout_key: format!("/repo/{name}"),
+                label: "herdr".into(),
+                repo_root: std::path::PathBuf::from(format!("/repo/{name}")),
+                is_linked_worktree: false,
+            }),
         });
         ws
     }
