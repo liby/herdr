@@ -567,9 +567,7 @@ impl Tab {
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> Option<PathBuf> {
         let terminal_id = self.terminal_id(pane_id)?;
-        terminal_runtimes
-            .get(terminal_id)
-            .and_then(|rt| rt.foreground_cwd())
+        terminal_runtimes.foreground_cwd(terminal_id)
     }
 
     pub fn follow_cwd_for_pane(

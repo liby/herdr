@@ -1070,7 +1070,18 @@ impl Workspace {
             return name.clone();
         }
 
-        self.resolved_identity_cwd_from(terminals, terminal_runtimes)
+        // The label uses the focused pane's foreground process cwd, then
+        // that pane's shell cwd, then the workspace identity cwd. The
+        // foreground cwd is transient and the label is display-only. The
+        // resolved identity for persistence and git status stays on the
+        // first tab's root pane.
+        self.active_tab()
+            .and_then(|tab| {
+                let pane = tab.layout.focused();
+                tab.foreground_cwd_for_pane(pane, terminal_runtimes)
+                    .or_else(|| tab.cwd_for_pane(pane, terminals, terminal_runtimes))
+            })
+            .or_else(|| self.resolved_identity_cwd_from(terminals, terminal_runtimes))
             .map(|cwd| derive_label_from_cwd(&cwd))
             .unwrap_or_else(|| "workspace".into())
     }
@@ -1576,18 +1587,105 @@ mod tests {
         let mut ws = Workspace::test_new("ignored");
         ws.custom_name = None;
         let root_pane = ws.tabs[0].root_pane;
+        let split_pane = ws.test_split(Direction::Horizontal);
+        let second_tab = ws.test_add_tab(None);
         let terminal_id = ws.tabs[0].terminal_id(root_pane).unwrap().clone();
+        let split_terminal = ws.tabs[0].terminal_id(split_pane).unwrap().clone();
         let mut terminals = HashMap::new();
         terminals.insert(
             terminal_id.clone(),
             TerminalState::new(terminal_id, PathBuf::from("/herdr-test/pion")),
         );
+        terminals.insert(
+            split_terminal.clone(),
+            TerminalState::new(split_terminal, PathBuf::from("/herdr-test/muon")),
+        );
         let terminal_runtimes = TerminalRuntimeRegistry::new();
 
+        ws.switch_tab(0);
+        ws.tabs[0].layout.focus_pane(root_pane);
         assert_eq!(ws.display_name_from(&terminals, &terminal_runtimes), "pion");
         assert_eq!(
             ws.resolved_identity_cwd_from(&terminals, &terminal_runtimes),
             Some(PathBuf::from("/herdr-test/pion"))
+        );
+
+        // The identity stays on the first tab's root pane when focus moves
+        // to another pane or another tab.
+        ws.tabs[0].layout.focus_pane(split_pane);
+        assert_eq!(
+            ws.resolved_identity_cwd_from(&terminals, &terminal_runtimes),
+            Some(PathBuf::from("/herdr-test/pion"))
+        );
+        ws.switch_tab(second_tab);
+        assert_eq!(
+            ws.resolved_identity_cwd_from(&terminals, &terminal_runtimes),
+            Some(PathBuf::from("/herdr-test/pion"))
+        );
+    }
+
+    #[test]
+    fn display_name_follows_focused_pane_foreground_cwd() {
+        let mut ws = Workspace::test_new("ignored");
+        ws.custom_name = None;
+        let root_pane = ws.tabs[0].root_pane;
+        let split_pane = ws.test_split(Direction::Horizontal);
+        let second_tab = ws.test_add_tab(None);
+        let second_tab_root = ws.tabs[second_tab].root_pane;
+        let root_terminal = ws.tabs[0].terminal_id(root_pane).unwrap().clone();
+        let split_terminal = ws.tabs[0].terminal_id(split_pane).unwrap().clone();
+        let second_tab_terminal = ws.tabs[second_tab]
+            .terminal_id(second_tab_root)
+            .unwrap()
+            .clone();
+
+        let mut terminals = HashMap::new();
+        terminals.insert(
+            root_terminal.clone(),
+            TerminalState::new(root_terminal.clone(), PathBuf::from("/herdr-test/pion")),
+        );
+        terminals.insert(
+            split_terminal.clone(),
+            TerminalState::new(split_terminal, PathBuf::from("/herdr-test/muon")),
+        );
+        terminals.insert(
+            second_tab_terminal.clone(),
+            TerminalState::new(
+                second_tab_terminal.clone(),
+                PathBuf::from("/herdr-test/tau"),
+            ),
+        );
+        let mut terminal_runtimes = TerminalRuntimeRegistry::new();
+        terminal_runtimes
+            .set_test_foreground_cwd(root_terminal, PathBuf::from("/herdr-test/root-nested"));
+        terminal_runtimes
+            .set_test_foreground_cwd(second_tab_terminal, PathBuf::from("/herdr-test/tab-nested"));
+
+        // The label prefers the focused pane's foreground cwd.
+        ws.switch_tab(0);
+        ws.tabs[0].layout.focus_pane(root_pane);
+        assert_eq!(
+            ws.display_name_from(&terminals, &terminal_runtimes),
+            "root-nested"
+        );
+
+        // Without a foreground cwd, the label uses the focused pane's shell
+        // cwd, not the first tab's root pane cwd.
+        ws.tabs[0].layout.focus_pane(split_pane);
+        assert_eq!(ws.display_name_from(&terminals, &terminal_runtimes), "muon");
+
+        // The label follows the active tab's focused pane.
+        ws.switch_tab(second_tab);
+        assert_eq!(
+            ws.display_name_from(&terminals, &terminal_runtimes),
+            "tab-nested"
+        );
+
+        // A custom name wins over every derived label source.
+        ws.custom_name = Some("named".into());
+        assert_eq!(
+            ws.display_name_from(&terminals, &terminal_runtimes),
+            "named"
         );
     }
 

@@ -7604,6 +7604,46 @@ next_tab = ""
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_cwd_change_forces_full_render_with_new_workspace_label() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+        server.app.state.workspaces[0].custom_name = None;
+
+        server.render_and_stream();
+        let baseline = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("baseline frame"),
+        );
+        assert!(!frame_text(&baseline).contains("fg-nested"));
+
+        // The detection task published a new foreground cwd. The terminal
+        // content did not change, so the retained pty path reports success
+        // without streaming a frame; it never re-renders the sidebar.
+        let terminal_id = server.app.state.workspaces[0].tabs[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .clone();
+        server.app.terminal_runtimes.set_test_foreground_cwd(
+            terminal_id,
+            std::path::PathBuf::from("/herdr-test/fg-nested"),
+        );
+        assert!(server.render_retained_pty_update_and_stream());
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        // The cwd-change event must force a full render that streams the
+        // new label.
+        assert!(server.handle_internal_event_with_forwarding(AppEvent::PaneForegroundCwdChanged));
+        server.render_and_stream();
+        let updated = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("updated frame"),
+        );
+        assert!(frame_text(&updated).contains("fg-nested"));
+    }
+
     #[test]
     fn outer_focus_gained_does_not_force_terminal_ansi_full_redraw_when_disabled() {
         let mut server = test_headless_server();

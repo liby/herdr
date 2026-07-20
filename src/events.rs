@@ -56,6 +56,11 @@ pub struct WorktreeRemoveResult {
 pub enum AppEvent {
     /// A pane's child process exited.
     PaneDied { pane_id: PaneId },
+    /// A pane's cached foreground process cwd changed. Forces a full
+    /// render so workspace labels pick up the new value. Only unix
+    /// detection tasks resolve foreground cwds.
+    #[cfg(unix)]
+    PaneForegroundCwdChanged,
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,
