@@ -2622,6 +2622,13 @@ impl AppState {
                 self.handle_pane_died(pane_id);
                 Vec::new()
             }
+            #[cfg(unix)]
+            AppEvent::PaneForegroundCwdChanged => {
+                // The new value already sits in the pane runtime cache. The
+                // event exists so the server leaves the retained-frame path
+                // and re-renders workspace labels.
+                Vec::new()
+            }
             AppEvent::UpdateReady {
                 version,
                 install_command,

@@ -84,6 +84,32 @@ fn wait_for_path(path: &Path, timeout: Duration) {
     panic!("path did not appear at {}", path.display());
 }
 
+/// The pane's detection task samples the foreground cwd and publishes it to
+/// a cache asynchronously. Poll `pane.get` until the cache shows the
+/// expected value. Return the last response for follow-up assertions.
+#[cfg(target_os = "linux")]
+fn wait_for_pane_foreground_cwd(
+    socket_path: &Path,
+    pane_id: &str,
+    expected: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let pane = send_request(
+            socket_path,
+            &format!(
+                r#"{{"id":"fg_wait","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
+                pane_id
+            ),
+        );
+        if pane["result"]["pane"]["foreground_cwd"] == expected || Instant::now() >= deadline {
+            return pane;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn spawn_herdr(config_home: &Path, runtime_dir: &Path, socket_path: &Path) -> SpawnedHerdr {
     spawn_herdr_with_options(config_home, runtime_dir, socket_path, None, "/bin/sh")
 }
@@ -779,12 +805,11 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         foreground
     );
 
-    let pane = send_request(
+    let pane = wait_for_pane_foreground_cwd(
         &socket_path,
-        &format!(
-            r#"{{"id":"fg_pane","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
-            pane_id
-        ),
+        &pane_id,
+        &foreground.display().to_string(),
+        Duration::from_secs(5),
     );
     assert_eq!(pane["result"]["pane"]["cwd"], base.display().to_string());
     assert_eq!(
@@ -1000,12 +1025,11 @@ fn new_terminal_cwd_follow_ignores_nonleader_group_member_cwd() {
         helper_cwd
     );
 
-    let pane = send_request(
+    let pane = wait_for_pane_foreground_cwd(
         &socket_path,
-        &format!(
-            r#"{{"id":"member_pane","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
-            pane_id
-        ),
+        &pane_id,
+        &helper_cwd.display().to_string(),
+        Duration::from_secs(5),
     );
     assert_eq!(pane["result"]["pane"]["cwd"], base.display().to_string());
     assert_eq!(

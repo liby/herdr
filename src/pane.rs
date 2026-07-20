@@ -286,6 +286,67 @@ fn foreground_member_cwd_different_from_shell(
     None
 }
 
+/// Resolve the cwd of the process group that controls the pane PTY.
+///
+/// A wrapper such as `just` or `make` can lead the foreground group and
+/// keep the shell's cwd while a group member runs in a different directory.
+/// Prefer a member cwd that differs from the shell cwd. Fall back to the
+/// leader cwd.
+#[cfg(unix)]
+fn resolve_foreground_cwd(
+    shell_pid: u32,
+    foreground_pgid: Option<u32>,
+) -> Option<std::path::PathBuf> {
+    let shell_cwd = usable_process_cwd(shell_pid);
+
+    let leader_cwd = foreground_pgid.and_then(usable_process_cwd);
+
+    if leader_cwd.as_ref() == shell_cwd.as_ref() {
+        foreground_member_cwd_different_from_shell(shell_pid, shell_cwd.as_ref()).or(leader_cwd)
+    } else {
+        leader_cwd
+            .or_else(|| foreground_member_cwd_different_from_shell(shell_pid, shell_cwd.as_ref()))
+    }
+}
+
+/// Publish the foreground cwd into the cache that `foreground_cwd()` reads.
+///
+/// This runs at the detection task's poll cadence. Readers (render, API
+/// snapshots) only read the cache. They do not walk process trees and they
+/// do not wait on the PTY actor. Returns true when the cached value
+/// changed.
+#[cfg(unix)]
+fn publish_foreground_cwd(
+    shell_pid: u32,
+    foreground_pgid: Option<u32>,
+    cache: &Arc<Mutex<Option<std::path::PathBuf>>>,
+) -> bool {
+    let resolved = (shell_pid > 0)
+        .then(|| resolve_foreground_cwd(shell_pid, foreground_pgid))
+        .flatten();
+    let Ok(mut cached) = cache.lock() else {
+        return false;
+    };
+    let changed = *cached != resolved;
+    *cached = resolved;
+    changed
+}
+
+/// Publish the foreground cwd and announce a change with
+/// `AppEvent::PaneForegroundCwdChanged`, so the server leaves the
+/// retained-frame path and re-renders workspace labels.
+#[cfg(unix)]
+async fn publish_foreground_cwd_and_notify(
+    shell_pid: u32,
+    foreground_pgid: Option<u32>,
+    cache: &Arc<Mutex<Option<std::path::PathBuf>>>,
+    state_events: &mpsc::Sender<AppEvent>,
+) {
+    if publish_foreground_cwd(shell_pid, foreground_pgid, cache) {
+        let _ = state_events.send(AppEvent::PaneForegroundCwdChanged).await;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForegroundShellAgentAction {
     ObserveProbe,
@@ -566,6 +627,7 @@ fn spawn_basic_detection_task(
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
+    foreground_cwd_cache: Arc<Mutex<Option<std::path::PathBuf>>>,
     state_events: mpsc::Sender<AppEvent>,
 ) -> (
     tokio::task::AbortHandle,
@@ -643,6 +705,13 @@ fn spawn_basic_detection_task(
             let foreground_pgid = (pid > 0)
                 .then(|| crate::detect::foreground_process_group_id(pid))
                 .flatten();
+            publish_foreground_cwd_and_notify(
+                pid,
+                foreground_pgid,
+                &foreground_cwd_cache,
+                &state_events,
+            )
+            .await;
             let process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
             let should_check_process = pid > 0 && {
@@ -932,6 +1001,10 @@ pub struct PaneRuntime {
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
+    /// The detection task writes this cache and `foreground_cwd()` reads it.
+    /// It stays `None` for panes without a detection task.
+    #[cfg(unix)]
+    foreground_cwd_cache: Arc<Mutex<Option<std::path::PathBuf>>>,
     child_wait_completed: Option<Arc<AtomicBool>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detection_content_seq: Arc<AtomicU64>,
@@ -1801,12 +1874,14 @@ impl PaneRuntime {
         };
 
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let foreground_cwd_cache = Arc::new(Mutex::new(None));
         let (detect_handle, detect_reset_notify, pending_release) = spawn_basic_detection_task(
             pane_id,
             child_pid.clone(),
             terminal.clone(),
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
+            foreground_cwd_cache.clone(),
             events,
         );
 
@@ -1817,6 +1892,7 @@ impl PaneRuntime {
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
+            foreground_cwd_cache,
             child_wait_completed: None,
             kitty_keyboard_flags,
             detection_content_seq,
@@ -1959,6 +2035,8 @@ impl PaneRuntime {
         };
 
         // --- Detection task ---
+        #[cfg(unix)]
+        let foreground_cwd_cache = Arc::new(Mutex::new(None));
         let (detect_handle, detect_reset_notify, pending_release) = if agent_detection
             == AgentDetection::Enabled
         {
@@ -1969,6 +2047,8 @@ impl PaneRuntime {
             const TICK_IDENTIFIED: Duration = Duration::from_millis(300);
             const TICK_PENDING_RELEASE: Duration = Duration::from_millis(50);
 
+            #[cfg(unix)]
+            let foreground_cwd_cache = foreground_cwd_cache.clone();
             let child_pid = child_pid.clone();
             let terminal = terminal.clone();
             let state_events = events.clone();
@@ -2058,6 +2138,14 @@ impl PaneRuntime {
                     let foreground_pgid = (pid > 0)
                         .then(|| detect::foreground_process_group_id(pid))
                         .flatten();
+                    #[cfg(unix)]
+                    publish_foreground_cwd_and_notify(
+                        pid,
+                        foreground_pgid,
+                        &foreground_cwd_cache,
+                        &state_events,
+                    )
+                    .await;
                     let process_group_changed =
                         foreground_group_changed(foreground_pgid, last_foreground_pgid);
                     let should_check_process = pid > 0 && {
@@ -2335,6 +2423,8 @@ impl PaneRuntime {
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
+            #[cfg(unix)]
+            foreground_cwd_cache,
             child_wait_completed: Some(child_wait_completed),
             kitty_keyboard_flags,
             detection_content_seq,
@@ -2687,6 +2777,12 @@ impl PaneRuntime {
     }
 
     /// Get the current working directory of the child shell process.
+    ///
+    /// The fallback probe stays synchronous, unlike `foreground_cwd()`. It
+    /// is one non-blocking `process_cwd` syscall on the shell pid. It does
+    /// not do a PTY-actor round trip or a process-tree walk. Persistence and
+    /// follow-cwd callers need the value at call time, not a detection-tick
+    /// sample.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
         if let Some(cwd) = self
             .reported_cwd
@@ -2723,23 +2819,18 @@ impl PaneRuntime {
     }
 
     /// Get the current working directory of the process group controlling the pane PTY.
+    ///
+    /// This reads the cache that the detection task publishes. On-demand
+    /// resolution needs a synchronous PTY-actor round trip, which can block
+    /// for up to 1s. Callers include the render path and API snapshots, and
+    /// they must not block. The value lags by at most one detection tick.
     pub fn foreground_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
-            let pid = self.child_pid.load(Ordering::Acquire);
-            let shell_cwd = usable_process_cwd(pid);
-            let foreground_pgid = self
-                .io
-                .foreground_process_group_id()
-                .or_else(|| crate::platform::foreground_process_group_id(pid));
-            let leader_cwd = foreground_pgid.and_then(usable_process_cwd);
-
-            if leader_cwd.as_ref() == shell_cwd.as_ref() {
-                foreground_member_cwd_different_from_shell(pid, shell_cwd.as_ref()).or(leader_cwd)
-            } else {
-                leader_cwd
-                    .or_else(|| foreground_member_cwd_different_from_shell(pid, shell_cwd.as_ref()))
-            }
+            self.foreground_cwd_cache
+                .lock()
+                .ok()
+                .and_then(|cached| cached.clone())
         }
 
         #[cfg(not(unix))]
@@ -2807,6 +2898,8 @@ impl PaneRuntime {
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
                 reported_cwd: Arc::new(Mutex::new(None)),
+                #[cfg(unix)]
+                foreground_cwd_cache: Arc::new(Mutex::new(None)),
                 child_wait_completed: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
@@ -2824,6 +2917,42 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_cwd_reads_published_cache_without_probing() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel_and_scrollback_bytes(4, 2, 0, b"", 4);
+        assert_eq!(runtime.foreground_cwd(), None);
+
+        // No live process can produce this path: the runtime has no child
+        // process, so the value must come from the cache alone.
+        let published = std::path::PathBuf::from("/herdr-test/published");
+        *runtime.foreground_cwd_cache.lock().unwrap() = Some(published.clone());
+        assert_eq!(runtime.foreground_cwd(), Some(published));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publish_foreground_cwd_notifies_only_changes() {
+        let cache = Arc::new(Mutex::new(Some(std::path::PathBuf::from(
+            "/herdr-test/old",
+        ))));
+        let (events, mut event_rx) = mpsc::channel(1);
+
+        // Pid 0 resolves to no foreground cwd, so the first publish clears
+        // the cache and announces the change on the app event channel.
+        publish_foreground_cwd_and_notify(0, None, &cache, &events).await;
+        assert_eq!(*cache.lock().unwrap(), None);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AppEvent::PaneForegroundCwdChanged)
+        ));
+
+        // The same resolution again is not a change and stays silent.
+        publish_foreground_cwd_and_notify(0, None, &cache, &events).await;
+        assert_eq!(*cache.lock().unwrap(), None);
+        assert!(event_rx.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn cwd_returns_accepted_report_without_rechecking_filesystem() {
@@ -3305,6 +3434,8 @@ mod tests {
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
+            #[cfg(unix)]
+            foreground_cwd_cache: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
@@ -3336,6 +3467,8 @@ mod tests {
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
             reported_cwd: Arc::new(Mutex::new(None)),
+            #[cfg(unix)]
+            foreground_cwd_cache: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detection_content_seq: Arc::new(AtomicU64::new(0)),

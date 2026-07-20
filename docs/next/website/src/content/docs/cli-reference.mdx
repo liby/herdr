@@ -248,7 +248,7 @@ herdr pane release-agent <pane_id> \
 
 `pane get`, `pane list`, `agent get`, and `agent list` include a read-only `agent_session` object when an official integration has reported a native session reference. If no native session reference is stored, the field is omitted.
 
-Those commands include `foreground_cwd` when Herdr can resolve the cwd of the foreground process controlling the pane. The existing `cwd` field remains the pane/workspace cwd used for labels and follow-cwd behavior.
+Those commands include `foreground_cwd` when Herdr can resolve the cwd of the foreground process controlling the pane. The value is sampled by a periodic probe, so it can briefly lag the live process. A custom workspace label always takes precedence; otherwise the label derives from the `foreground_cwd` of the focused pane in the active tab, then that pane's shell cwd, then the workspace identity cwd. The existing `cwd` field remains the pane/workspace cwd used for follow-cwd behavior.
 
 `pane get` and `pane list` include `scroll` when terminal scroll metrics are available. `scroll.offset_from_bottom == 0` means the pane is at the bottom of its scrollback.
 

@@ -10,6 +10,10 @@ use super::{TerminalId, TerminalRuntime};
 #[derive(Default)]
 pub(crate) struct TerminalRuntimeRegistry {
     runtimes: HashMap<TerminalId, TerminalRuntime>,
+    /// Test-only foreground cwd overrides. Real foreground cwds come from live
+    /// process trees, which unit tests cannot construct.
+    #[cfg(test)]
+    test_foreground_cwds: HashMap<TerminalId, std::path::PathBuf>,
 }
 
 impl TerminalRuntimeRegistry {
@@ -19,6 +23,24 @@ impl TerminalRuntimeRegistry {
 
     pub(crate) fn get(&self, terminal_id: &TerminalId) -> Option<&TerminalRuntime> {
         self.runtimes.get(terminal_id)
+    }
+
+    pub(crate) fn foreground_cwd(&self, terminal_id: &TerminalId) -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(cwd) = self.test_foreground_cwds.get(terminal_id) {
+            return Some(cwd.clone());
+        }
+        self.get(terminal_id)
+            .and_then(|runtime| runtime.foreground_cwd())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_foreground_cwd(
+        &mut self,
+        terminal_id: TerminalId,
+        cwd: std::path::PathBuf,
+    ) {
+        self.test_foreground_cwds.insert(terminal_id, cwd);
     }
 
     pub(crate) fn insert(
@@ -82,6 +104,10 @@ impl TerminalRuntimeRegistry {
 
 impl From<HashMap<TerminalId, TerminalRuntime>> for TerminalRuntimeRegistry {
     fn from(runtimes: HashMap<TerminalId, TerminalRuntime>) -> Self {
-        Self { runtimes }
+        Self {
+            runtimes,
+            #[cfg(test)]
+            test_foreground_cwds: HashMap::new(),
+        }
     }
 }
