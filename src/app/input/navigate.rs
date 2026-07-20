@@ -1740,17 +1740,13 @@ fn workspace_can_start_worktree_action(
     let Some(ws) = state.workspaces.get(ws_idx) else {
         return false;
     };
-    if ws
-        .worktree_space()
-        .is_some_and(|space| space.is_linked_worktree)
-    {
-        return false;
+    // A durable parent membership decides eligibility. The live resolved
+    // identity must not veto it: the focused pane can sit in a linked
+    // checkout while the workspace stays the managed parent.
+    if let Some(space) = ws.worktree_space() {
+        return !space.is_linked_worktree;
     }
-    let git_space = ws.git_space().cloned().or_else(|| {
-        ws.resolved_identity_cwd_from(&state.terminals, terminal_runtimes)
-            .as_deref()
-            .and_then(crate::workspace::git_space_metadata)
-    });
+    let git_space = ws.git_space_for_identity(&state.terminals, terminal_runtimes);
     !git_space.is_some_and(|space| space.is_linked_worktree)
 }
 
@@ -1848,6 +1844,48 @@ mod tests {
     use crate::{
         app::App, config::Config, input::TerminalKey, terminal::TerminalState, workspace::Workspace,
     };
+
+    #[test]
+    fn managed_parent_can_start_worktree_action_with_linked_identity() {
+        let mut state = state_with_workspaces(&["parent"]);
+        state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+        // The focused pane sits at the root of a linked checkout: the cache
+        // pairs the resolved identity cwd with linked metadata whose
+        // checkout is that same cwd.
+        let resolved = state.workspaces[0].resolved_identity_cwd().unwrap();
+        state.workspaces[0].cached_git_space = Some(crate::workspace::GitSpaceCache {
+            space: Some(crate::workspace::GitSpaceMetadata {
+                key: "repo-key".into(),
+                checkout_key: resolved.display().to_string(),
+                label: "herdr".into(),
+                repo_root: "/repo/herdr".into(),
+                is_linked_worktree: true,
+            }),
+            source_cwd: resolved,
+        });
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        // The durable parent membership keeps the action available.
+        assert!(workspace_can_start_worktree_action(
+            &state,
+            &terminal_runtimes,
+            0
+        ));
+
+        // Without the membership, the linked identity blocks the action.
+        state.workspaces[0].worktree_space = None;
+        assert!(!workspace_can_start_worktree_action(
+            &state,
+            &terminal_runtimes,
+            0
+        ));
+    }
 
     fn mark_worktree_space_member(state: &mut AppState, ws_idx: usize, key: &str) {
         state.workspaces[ws_idx].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {

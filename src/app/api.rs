@@ -15,6 +15,8 @@ mod tabs;
 mod workspaces;
 mod worktrees;
 
+pub(crate) use self::worktrees::WorktreeSource;
+
 use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};
 use crate::events::AppEvent;
 

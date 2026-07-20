@@ -1015,12 +1015,21 @@ mod tests {
             .clone();
         state.terminals.get_mut(&second_terminal_id).unwrap().cwd = PathBuf::from("/tmp/herdr");
 
+        // The split above left focus on the second pane. The captured
+        // workspace identity follows the focused pane.
         let snapshot = capture_from_state(&state);
         let workspace = &snapshot.workspaces[0];
         let tab = &workspace.tabs[0];
-        assert_eq!(workspace.identity_cwd, PathBuf::from("/tmp/pion"));
+        assert_eq!(workspace.identity_cwd, PathBuf::from("/tmp/herdr"));
         assert_eq!(tab.panes[&root.raw()].cwd, PathBuf::from("/tmp/pion"));
         assert_eq!(tab.panes[&second.raw()].cwd, PathBuf::from("/tmp/herdr"));
+
+        state.workspaces[0].tabs[0].layout.focus_pane(root);
+        let snapshot = capture_from_state(&state);
+        assert_eq!(
+            snapshot.workspaces[0].identity_cwd,
+            PathBuf::from("/tmp/pion")
+        );
     }
 
     #[tokio::test]
